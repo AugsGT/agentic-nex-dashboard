@@ -1,4 +1,5 @@
 import time
+import json
 import requests
 import pandas as pd
 import streamlit as st
@@ -22,7 +23,10 @@ def graph_get(path, token, params=None):
     url = f"{GRAPH_BASE}/{path.lstrip('/')}"
     headers = {"Authorization": f"Bearer {token}"}
     resp = requests.get(url, headers=headers, params=params or {})
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Non-JSON response from Graph API ({resp.status_code}): {resp.text[:300]}")
     if resp.status_code != 200:
         err = data.get("error", {})
         raise RuntimeError(f"Graph error {err.get('code')}: {err.get('message')}")
@@ -57,26 +61,59 @@ def parse_lead(lead):
         row[f"field__{k}"] = v
     return row
 
-def get_leads(form_id, token, limit=50, older_than=None):
+def get_leads(form_id, token, limit=50, older_than=None, fields=None):
+    """
+    Robust lead fetcher that follows paging.next URLs.
+    """
     collected = []
-    endpoint = f"/{form_id}/leads"
-    params = {"limit": min(limit, 100)}
-    if older_than:
-        params["filtering"] = [{"field": "time_created", "operator": "LESS_THAN", "value": older_than}]
-    next_url = None
+    if fields is None:
+        fields = [
+            "field_data",
+            "created_time",
+            "ad_id",
+            "adset_id",
+            "campaign_id",
+            "is_organic",
+            "platform",
+            "id"
+        ]
 
-    while len(collected) < limit:
-        if next_url:
-            data = graph_get(next_url.replace(GRAPH_BASE + "/", ""), token)
+    base_url = f"{GRAPH_BASE}/{form_id}/leads"
+    params = {"limit": min(max(1, int(limit)), 100), "fields": ",".join(fields)}
+    if older_than:
+        params["filtering"] = json.dumps([{"field": "time_created", "operator": "LESS_THAN", "value": int(older_than)}])
+
+    headers = {"Authorization": f"Bearer {token}"}
+    url = base_url
+    first = True
+
+    while len(collected) < limit and url:
+        if first:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            first = False
         else:
-            data = graph_get(endpoint, token, params=params)
+            resp = requests.get(url, headers=headers, timeout=30)
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(f"Non-JSON response from Graph API ({resp.status_code}): {resp.text[:300]}")
+
+        if resp.status_code != 200:
+            err = data.get("error", {})
+            raise RuntimeError(f"Graph error {err.get('code')}: {err.get('message')}")
+
         batch = data.get("data", [])
-        collected.extend(batch)
-        paging = data.get("paging", {})
-        next_url = paging.get("next")
-        if not next_url or not batch:
+        if not batch:
             break
-        time.sleep(0.1)
+
+        collected.extend(batch)
+
+        paging = data.get("paging", {})
+        url = paging.get("next")
+
+        if url:
+            time.sleep(0.12)
 
     return collected[:limit]
 
@@ -99,7 +136,6 @@ if not access_token:
 # -----------------------
 st.title("Agentic Nex — Facebook Lead Ads Dashboard")
 
-# Page (single, since token is tied to it)
 with st.spinner("Loading page…"):
     pages = get_page(access_token)
 
@@ -111,7 +147,6 @@ page_map = {p["name"]: p["id"] for p in pages}
 page_name = st.selectbox("Page", options=list(page_map.keys()))
 page_id = page_map[page_name]
 
-# Forms
 with st.spinner("Loading forms…"):
     forms = get_forms(page_id, access_token)
 
@@ -123,7 +158,6 @@ form_map = {f["name"]: f["id"] for f in forms}
 form_name = st.selectbox("Form", options=list(form_map.keys()))
 form_id = form_map[form_name]
 
-# Options
 c1, c2 = st.columns([1,1])
 with c1:
     limit = st.number_input("Limit", min_value=1, max_value=3200, value=20, step=10)
