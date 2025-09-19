@@ -2,3 +2,6 @@ streamlit
 requests
 pandas
 json
+altair
+sqlalchemy
+dotenv
